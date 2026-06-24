@@ -35,11 +35,12 @@ static uintptr_t getLibBase(const char* name) {
     return 0;
 }
 
-static volatile int g_resumed = 0;
-static volatile int g_running = 1;
-static JavaVM*   g_jvm        = nullptr;
-static jclass    g_cls        = nullptr;
-static jmethodID g_showDialog = nullptr;
+static volatile int g_resumed  = 0;
+static volatile int g_running  = 1;
+static JavaVM*      g_jvm      = nullptr;
+static jobject      g_activity = nullptr; // instance method butuh object
+static jclass       g_cls      = nullptr;
+static jmethodID    g_showPlayerDialog = nullptr;
 static volatile int g_jni_ready = 0;
 
 static void (*orig_AndroidPause)() = nullptr;
@@ -48,36 +49,48 @@ static void hook_AndroidPause() {
     if (orig_AndroidPause) orig_AndroidPause();
 }
 
-// Dump semua method class ke log
-static void dumpMethods(JNIEnv* env, jclass cls) {
-    jclass clsCls = env->FindClass("java/lang/Class");
-    jmethodID getMethods = env->GetMethodID(clsCls, "getMethods", "()[Ljava/lang/reflect/Method;");
-    jobjectArray methods = (jobjectArray)env->CallObjectMethod(cls, getMethods);
-    if (!methods) { logff("[BG] getMethods null"); return; }
+static jbyteArray strToBytes(JNIEnv* env, const char* str) {
+    int len = strlen(str);
+    jbyteArray arr = env->NewByteArray(len);
+    env->SetByteArrayRegion(arr, 0, len, (jbyte*)str);
+    return arr;
+}
 
-    jclass methodCls = env->FindClass("java/lang/reflect/Method");
-    jmethodID getName = env->GetMethodID(methodCls, "getName", "()Ljava/lang/String;");
-    jmethodID toString = env->GetMethodID(methodCls, "toString", "()Ljava/lang/String;");
-
-    int len = env->GetArrayLength(methods);
-    logff("[BG] Total methods: %d", len);
-    for (int i = 0; i < len; i++) {
-        jobject m = env->GetObjectArrayElement(methods, i);
-        jstring nameStr = (jstring)env->CallObjectMethod(m, toString);
-        const char* c = env->GetStringUTFChars(nameStr, nullptr);
-        if (strstr(c, "ialog") || strstr(c, "show") || strstr(c, "Show")) {
-            logff("[BG] METHOD[%d]: %s", i, c);
-        }
-        env->ReleaseStringUTFChars(nameStr, c);
-        env->DeleteLocalRef(nameStr);
-        env->DeleteLocalRef(m);
+static void showDialog(int id, int style, const char* title, const char* msg, const char* btn1, const char* btn2) {
+    if (!g_jni_ready || !g_jvm || !g_activity || !g_showPlayerDialog) {
+        logff("[BG] JNI belum siap");
+        return;
     }
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+        g_jvm->AttachCurrentThread(&env, nullptr);
+        attached = true;
+    }
+    if (!env) return;
+
+    jbyteArray jTitle = strToBytes(env, title);
+    jbyteArray jMsg   = strToBytes(env, msg);
+    jbyteArray jBtn1  = strToBytes(env, btn1);
+    jbyteArray jBtn2  = strToBytes(env, btn2);
+
+    // void showPlayerDialog(int id, int style, byte[] title, byte[] msg, byte[] btn1, byte[] btn2)
+    env->CallVoidMethod(g_activity, g_showPlayerDialog, id, style, jTitle, jMsg, jBtn1, jBtn2);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); logff("[BG] Exception showPlayerDialog"); }
+
+    env->DeleteLocalRef(jTitle);
+    env->DeleteLocalRef(jMsg);
+    env->DeleteLocalRef(jBtn1);
+    env->DeleteLocalRef(jBtn2);
+
+    if (attached) g_jvm->DetachCurrentThread();
+    logff("[BG] showPlayerDialog done");
 }
 
 static void initJNI() {
     void* h = dlopen("libnativehelper.so", RTLD_NOW | RTLD_GLOBAL);
     if (!h) h = dlopen("/apex/com.android.art/lib/libart.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!h) { logff("[BG] ERROR: libnativehelper/libart"); return; }
+    if (!h) { logff("[BG] ERROR: libnativehelper"); return; }
 
     auto getVMs = (jint(*)(JavaVM**, jsize, jsize*))dlsym(h, "JNI_GetCreatedJavaVMs");
     if (!getVMs) { logff("[BG] ERROR: JNI_GetCreatedJavaVMs"); return; }
@@ -91,41 +104,42 @@ static void initJNI() {
     g_jvm->AttachCurrentThread(&env, nullptr);
     if (!env) { logff("[BG] ERROR: env null"); return; }
 
+    // Dapatkan Activity instance via ActivityThread
     jclass atCls = env->FindClass("android/app/ActivityThread");
-    jmethodID curApp = env->GetStaticMethodID(atCls, "currentApplication", "()Landroid/app/Application;");
-    jobject app = env->CallStaticObjectMethod(atCls, curApp);
-    jclass appCls = env->GetObjectClass(app);
-    jmethodID getCL = env->GetMethodID(appCls, "getClassLoader", "()Ljava/lang/ClassLoader;");
-    jobject cl = env->CallObjectMethod(app, getCL);
-    jclass clCls = env->GetObjectClass(cl);
-    jmethodID loadClass = env->GetMethodID(clCls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+    jmethodID curActivity = env->GetStaticMethodID(atCls, "currentActivity", "()Landroid/app/Activity;");
+    jobject activity = env->CallStaticObjectMethod(atCls, curActivity);
+    if (!activity) { logff("[BG] ERROR: activity null"); g_jvm->DetachCurrentThread(); return; }
+    g_activity = env->NewGlobalRef(activity);
+    logff("[BG] activity OK");
 
-    jstring cn = env->NewStringUTF("com.arizona.game.GTASA");
-    jclass gtasaCls = (jclass)env->CallObjectMethod(cl, loadClass, cn);
-    env->DeleteLocalRef(cn);
-    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    g_cls = (jclass)env->NewGlobalRef(env->GetObjectClass(activity));
 
-    if (!gtasaCls) { logff("[BG] ERROR: class GTASA null"); g_jvm->DetachCurrentThread(); return; }
-    g_cls = (jclass)env->NewGlobalRef(gtasaCls);
-    logff("[BG] class GTASA OK - dumping methods...");
-
-    // Dump semua method untuk cari nama yang benar
-    dumpMethods(env, g_cls);
+    // showPlayerDialog(int, int, byte[], byte[], byte[], byte[])
+    g_showPlayerDialog = env->GetMethodID(g_cls, "showPlayerDialog", "(II[B[B[B[B)V");
+    if (!g_showPlayerDialog) {
+        env->ExceptionClear();
+        logff("[BG] ERROR: showPlayerDialog method null");
+        g_jvm->DetachCurrentThread();
+        return;
+    }
+    logff("[BG] showPlayerDialog method OK");
 
     g_jvm->DetachCurrentThread();
     g_jni_ready = 1;
+    logff("[BG] JNI siap!");
 }
 
 static void* resume_thread(void*) {
     logff("[BG] resume_thread started");
-    usleep(5000000); // 5 detik
+    usleep(5000000); // 5 detik tunggu game boot
     initJNI();
 
     while (g_running) {
         if (g_resumed) {
             g_resumed = 0;
             usleep(500000);
-            logff("[BG] Resume detected! g_showDialog=%p", (void*)g_showDialog);
+            logff("[BG] Resume detected!");
+            showDialog(99, 0, "Selamat Datang", "Kamu baru saja kembali ke game!", "OK", "");
         }
         usleep(200000);
     }
@@ -135,14 +149,14 @@ static void* resume_thread(void*) {
 extern "C" {
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "bgdetect|1.6|Background Resume Detector|brruham";
+    static const char* info = "bgdetect|1.7|Background Resume Detector|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
-    g_resumed = 0;
-    g_running = 1;
+    g_resumed   = 0;
+    g_running   = 1;
     g_jni_ready = 0;
     logff("[BG] OnModPreLoad");
 }
