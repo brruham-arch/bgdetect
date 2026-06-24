@@ -1,0 +1,29 @@
+name: Build bgdetect
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          add-to-path: true
+
+      - name: Build
+        run: |
+          cd ${{ github.workspace }}
+          ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=jni/Android.mk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: libbgdetect
+          path: libs/armeabi-v7a/libbgdetect.so
