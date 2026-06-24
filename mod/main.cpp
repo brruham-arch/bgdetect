@@ -37,8 +37,8 @@ static uintptr_t getLibBase(const char* name) {
 
 static volatile int g_resumed = 0;
 static volatile int g_running = 1;
-static JavaVM*   g_jvm       = nullptr;
-static jclass    g_cls       = nullptr;
+static JavaVM*   g_jvm        = nullptr;
+static jclass    g_cls        = nullptr;
 static jmethodID g_showDialog = nullptr;
 static volatile int g_jni_ready = 0;
 
@@ -46,6 +46,32 @@ static void (*orig_AndroidPause)() = nullptr;
 static void hook_AndroidPause() {
     g_resumed = 1;
     if (orig_AndroidPause) orig_AndroidPause();
+}
+
+// Dump semua method class ke log
+static void dumpMethods(JNIEnv* env, jclass cls) {
+    jclass clsCls = env->FindClass("java/lang/Class");
+    jmethodID getMethods = env->GetMethodID(clsCls, "getMethods", "()[Ljava/lang/reflect/Method;");
+    jobjectArray methods = (jobjectArray)env->CallObjectMethod(cls, getMethods);
+    if (!methods) { logff("[BG] getMethods null"); return; }
+
+    jclass methodCls = env->FindClass("java/lang/reflect/Method");
+    jmethodID getName = env->GetMethodID(methodCls, "getName", "()Ljava/lang/String;");
+    jmethodID toString = env->GetMethodID(methodCls, "toString", "()Ljava/lang/String;");
+
+    int len = env->GetArrayLength(methods);
+    logff("[BG] Total methods: %d", len);
+    for (int i = 0; i < len; i++) {
+        jobject m = env->GetObjectArrayElement(methods, i);
+        jstring nameStr = (jstring)env->CallObjectMethod(m, toString);
+        const char* c = env->GetStringUTFChars(nameStr, nullptr);
+        if (strstr(c, "ialog") || strstr(c, "show") || strstr(c, "Show")) {
+            logff("[BG] METHOD[%d]: %s", i, c);
+        }
+        env->ReleaseStringUTFChars(nameStr, c);
+        env->DeleteLocalRef(nameStr);
+        env->DeleteLocalRef(m);
+    }
 }
 
 static void initJNI() {
@@ -65,7 +91,6 @@ static void initJNI() {
     g_jvm->AttachCurrentThread(&env, nullptr);
     if (!env) { logff("[BG] ERROR: env null"); return; }
 
-    // Dapatkan ClassLoader via ActivityThread
     jclass atCls = env->FindClass("android/app/ActivityThread");
     jmethodID curApp = env->GetStaticMethodID(atCls, "currentApplication", "()Landroid/app/Application;");
     jobject app = env->CallStaticObjectMethod(atCls, curApp);
@@ -78,56 +103,21 @@ static void initJNI() {
     jstring cn = env->NewStringUTF("com.arizona.game.GTASA");
     jclass gtasaCls = (jclass)env->CallObjectMethod(cl, loadClass, cn);
     env->DeleteLocalRef(cn);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 
     if (!gtasaCls) { logff("[BG] ERROR: class GTASA null"); g_jvm->DetachCurrentThread(); return; }
     g_cls = (jclass)env->NewGlobalRef(gtasaCls);
-    logff("[BG] class GTASA OK");
+    logff("[BG] class GTASA OK - dumping methods...");
 
-    // Coba beberapa nama method
-    const char* sigs[] = {
-        "showDialog", "ShowDialog", "displayDialog", "showSampDialog", nullptr
-    };
-    const char* sig = "(IILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V";
-    for (int i = 0; sigs[i]; i++) {
-        g_showDialog = env->GetStaticMethodID(g_cls, sigs[i], sig);
-        if (g_showDialog) { logff("[BG] method '%s' OK", sigs[i]); break; }
-        env->ExceptionClear();
-    }
-    if (!g_showDialog) logff("[BG] WARN: semua method tidak ditemukan");
+    // Dump semua method untuk cari nama yang benar
+    dumpMethods(env, g_cls);
 
     g_jvm->DetachCurrentThread();
     g_jni_ready = 1;
 }
 
-static void showDialogJNI(int id, int style, const char* title, const char* msg, const char* btn1, const char* btn2) {
-    if (!g_jni_ready || !g_jvm || !g_cls || !g_showDialog) {
-        logff("[BG] JNI belum siap");
-        return;
-    }
-    JNIEnv* env = nullptr;
-    bool attached = false;
-    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
-        g_jvm->AttachCurrentThread(&env, nullptr);
-        attached = true;
-    }
-    if (!env) return;
-
-    jstring jt  = env->NewStringUTF(title);
-    jstring jm  = env->NewStringUTF(msg);
-    jstring jb1 = env->NewStringUTF(btn1);
-    jstring jb2 = env->NewStringUTF(btn2);
-    env->CallStaticVoidMethod(g_cls, g_showDialog, id, style, jt, jm, jb1, jb2);
-    if (env->ExceptionCheck()) { env->ExceptionClear(); logff("[BG] Exception saat showDialog"); }
-    env->DeleteLocalRef(jt); env->DeleteLocalRef(jm);
-    env->DeleteLocalRef(jb1); env->DeleteLocalRef(jb2);
-    if (attached) g_jvm->DetachCurrentThread();
-    logff("[BG] showDialogJNI done");
-}
-
 static void* resume_thread(void*) {
     logff("[BG] resume_thread started");
-
-    // Tunggu game siap baru init JNI
     usleep(5000000); // 5 detik
     initJNI();
 
@@ -135,8 +125,7 @@ static void* resume_thread(void*) {
         if (g_resumed) {
             g_resumed = 0;
             usleep(500000);
-            logff("[BG] Resume detected!");
-            showDialogJNI(99, 0, "Selamat Datang", "Kamu baru saja kembali ke game!", "OK", "");
+            logff("[BG] Resume detected! g_showDialog=%p", (void*)g_showDialog);
         }
         usleep(200000);
     }
@@ -146,7 +135,7 @@ static void* resume_thread(void*) {
 extern "C" {
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "bgdetect|1.5|Background Resume Detector|brruham";
+    static const char* info = "bgdetect|1.6|Background Resume Detector|brruham";
     return (void*)info;
 }
 
