@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdlib.h>
 #include <dlfcn.h>
 #include <android/log.h>
 #include <stdio.h>
@@ -52,7 +53,7 @@ static void* resume_thread(void*) {
     while (g_running) {
         if (g_resumed) {
             g_resumed = 0;
-            usleep(500000); // 500ms tunggu game stabil
+            usleep(500000);
             logff("[BG] Resume! Tampilkan dialog...");
             if (pShowDialog) {
                 pShowDialog(99, 0,
@@ -91,12 +92,9 @@ EXPORT void OnModLoad() {
     auto dobbyHook = (int(*)(void*,void*,void**))dlsym(hDobby, "DobbyHook");
     if (!dobbyHook) { logff("[BG] ERROR: DobbyHook sym"); return; }
 
-    // Base via /proc/self/maps
     uintptr_t gtaBase = getLibBase("libGTASA.so");
     if (!gtaBase) { logff("[BG] ERROR: gtaBase=0"); return; }
 
-    // _Z12AndroidPausev @ file offset 0x269AF5 (sudah Thumb)
-    // target = base + 0x269AF4, lalu +1 untuk Thumb
     void* target = (void*)(gtaBase + 0x269AF4 + 1);
     logff("[BG] AndroidPause target=%p", target);
 
@@ -105,7 +103,6 @@ EXPORT void OnModLoad() {
     if (r != 0) { logff("[BG] ERROR: DobbyHook gagal r=%d", r); return; }
     logff("[BG] Hook AndroidPause OK");
 
-    // sampShowDialog dari libsamp via dlsym
     void* hSamp = dlopen("libsamp.so", RTLD_NOW | RTLD_NOLOAD);
     if (!hSamp) { logff("[BG] ERROR: libsamp"); return; }
     pShowDialog = (ShowDialog_t)dlsym(hSamp, "sampShowDialog");
